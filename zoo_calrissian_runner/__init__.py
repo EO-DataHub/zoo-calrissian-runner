@@ -429,7 +429,7 @@ class ZooCalrissianRunner:
             executing_workspace=self.executing_workspace,
             job_id=self.job_id,
             calling_service_account=self.zoo_conf.conf.get("eodhp", {}).get(
-                "serviceAccountNameCalling", "default"
+                "serviceAccountNameCaller", "default"
             ),
         )
         session.initialise()
