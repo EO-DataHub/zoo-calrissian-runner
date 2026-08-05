@@ -435,107 +435,108 @@ class ZooCalrissianRunner:
         session.initialise()
         self.update_status(progress=15, message="processing environment created, preparing execution")
 
-        processing_parameters = {
-            "process": namespace,
-            **self.get_processing_parameters(),
-            **self.handler.get_additional_parameters(),
-        }
+        try:
+            processing_parameters = {
+                "process": namespace,
+                **self.get_processing_parameters(),
+                **self.handler.get_additional_parameters(),
+            }
 
 
-        self.update_status(progress=20, message="upload required files")
+            self.update_status(progress=20, message="upload required files")
 
 
-        # Upload input complex data into calrissian_wdir
-        for i in processing_parameters:
-            if isinstance(processing_parameters[i],dict):
-                if processing_parameters[i]["class"]=="File":
-                    copy_to_volume(
-                        context=session,
-                        volume={
-                            "name": session.calrissian_wdir,
-                            "persistentVolumeClaim": {
-                                "claimName": session.calrissian_wdir
-                            }
-                        },
-                        volume_mount={
-                            "name": session.calrissian_wdir,
-                            "mountPath": "/calrissian",
-                        },
-                        source_paths=[
-                            processing_parameters[i]["path"]
-                        ],
-                        destination_path="/calrissian",
-                    )
-                    processing_parameters[i]["path"]=processing_parameters[i]["path"].replace(self.zoo_conf.conf["main"]["tmpPath"],"/calrissian")
-        # checks if all parameters where provided
+            # Upload input complex data into calrissian_wdir
+            for i in processing_parameters:
+                if isinstance(processing_parameters[i],dict):
+                    if processing_parameters[i]["class"]=="File":
+                        copy_to_volume(
+                            context=session,
+                            volume={
+                                "name": session.calrissian_wdir,
+                                "persistentVolumeClaim": {
+                                    "claimName": session.calrissian_wdir
+                                }
+                            },
+                            volume_mount={
+                                "name": session.calrissian_wdir,
+                                "mountPath": "/calrissian",
+                            },
+                            source_paths=[
+                                processing_parameters[i]["path"]
+                            ],
+                            destination_path="/calrissian",
+                        )
+                        processing_parameters[i]["path"]=processing_parameters[i]["path"].replace(self.zoo_conf.conf["main"]["tmpPath"],"/calrissian")
+            # checks if all parameters where provided
 
-        logger.info("create Calrissian job")
-        job = CalrissianJob(
-            cwl=wrapped_workflow,
-            params=processing_parameters,
-            runtime_context=session,
-            cwl_entry_point="main",
-            max_cores=self.get_max_cores(),
-            max_ram=self.get_max_ram(),
-            pod_env_vars=self.handler.get_pod_env_vars(),
-            pod_node_selector=self.handler.get_pod_node_selector(),
-            debug=True,
-            no_read_only=True,
-            tool_logs=True,
-            calling_workspace=self.calling_workspace,
-            executing_workspace=self.executing_workspace,
-            job_id=self.job_id,
-        )
+            logger.info("create Calrissian job")
+            job = CalrissianJob(
+                cwl=wrapped_workflow,
+                params=processing_parameters,
+                runtime_context=session,
+                cwl_entry_point="main",
+                max_cores=self.get_max_cores(),
+                max_ram=self.get_max_ram(),
+                pod_env_vars=self.handler.get_pod_env_vars(),
+                pod_node_selector=self.handler.get_pod_node_selector(),
+                debug=True,
+                no_read_only=True,
+                tool_logs=True,
+                calling_workspace=self.calling_workspace,
+                executing_workspace=self.executing_workspace,
+                job_id=self.job_id,
+            )
 
-        self.update_status(progress=23, message="execution submitted")
+            self.update_status(progress=23, message="execution submitted")
 
-        logger.info("execution")
-        self.execution = CalrissianExecution(job=job, runtime_context=session)
-        self.execution.submit()
+            logger.info("execution")
+            self.execution = CalrissianExecution(job=job, runtime_context=session)
+            self.execution.submit()
 
-        self.execution.monitor(interval=self.monitor_interval)
+            self.execution.monitor(interval=self.monitor_interval)
 
-        if self.execution.is_complete():
-            logger.info("execution complete")
+            if self.execution.is_complete():
+                logger.info("execution complete")
 
-        if self.execution.is_succeeded():
-            exit_value = zoo.SERVICE_SUCCEEDED
-        else:
-            exit_value = zoo.SERVICE_FAILED
+            if self.execution.is_succeeded():
+                exit_value = zoo.SERVICE_SUCCEEDED
+            else:
+                exit_value = zoo.SERVICE_FAILED
 
-        self.update_status(progress=90, message="delivering outputs, logs and usage report")
+            self.update_status(progress=90, message="delivering outputs, logs and usage report")
 
-        logger.info("handle outputs execution logs")
-        output = self.execution.get_output()
-        log = self.execution.get_log()
-        usage_report = self.execution.get_usage_report()
-        tool_logs = self.execution.get_tool_logs()
+            logger.info("handle outputs execution logs")
+            output = self.execution.get_output()
+            log = self.execution.get_log()
+            usage_report = self.execution.get_usage_report()
+            tool_logs = self.execution.get_tool_logs()
 
-        self.outputs.set_output(output)
+            self.outputs.set_output(output)
 
-        self.handler.handle_outputs(
-            log=log,
-            output=output,
-            usage_report=usage_report,
-            tool_logs=tool_logs,
-        )
+            self.handler.handle_outputs(
+                log=log,
+                output=output,
+                usage_report=usage_report,
+                tool_logs=tool_logs,
+            )
 
-        self.update_status(progress=97, message="Post-execution hook")
-        self.handler.post_execution_hook(
-            log=log,
-            output=output,
-            usage_report=usage_report,
-            tool_logs=tool_logs,
-        )
+            self.update_status(progress=97, message="Post-execution hook")
+            self.handler.post_execution_hook(
+                log=log,
+                output=output,
+                usage_report=usage_report,
+                tool_logs=tool_logs,
+            )
+        finally:
+            self.update_status(progress=99, message="clean-up processing resources")
 
-        self.update_status(progress=99, message="clean-up processing resources")
-
-        # use an environment variable to decide if we want to clean up the resources
-        if os.environ.get("KEEP_SESSION", "false") == "false":
-            logger.info("clean-up kubernetes resources")
-            session.dispose()
-        else:
-            logger.info("kubernetes resources not cleaned up")
+            # use an environment variable to decide if we want to clean up the resources
+            if os.environ.get("KEEP_SESSION", "false") == "false":
+                logger.info("clean-up kubernetes resources")
+                session.dispose_job_resources()
+            else:
+                logger.info("kubernetes resources not cleaned up")
 
         self.update_status(
             progress=100,
