@@ -486,6 +486,10 @@ class ZooCalrissianRunner:
                 calling_workspace=self.calling_workspace,
                 executing_workspace=self.executing_workspace,
                 job_id=self.job_id,
+                # Never let Kubernetes re-run the Calrissian pod. A re-run
+                # reuses the first run's working directory and fails, and it
+                # duplicates work. A lost pod must fail the job instead.
+                backoff_limit=0,
             )
 
             self.update_status(progress=23, message="execution submitted")
