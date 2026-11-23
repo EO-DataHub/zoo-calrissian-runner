@@ -74,6 +74,69 @@ class TestGetFailureReason(unittest.TestCase):
         self.assertEqual(len(reason), 500)
         self.assertTrue(reason.endswith("..."))
 
+    def test_exception_names(self):
+        for line in [
+            "Exception: missing required credential",
+            "Exception",
+            "ValueError: bad input",
+            "cwltool.errors.WorkflowException: bad step",
+            "SystemExit: 1",
+        ]:
+            log = "Traceback (most recent call last):\n  File \"x.py\", line 1\n" + line
+            self.assertEqual(get_failure_reason(log), line)
+
+    def test_prose_is_not_an_exception(self):
+        log = (
+            "Traceback (most recent call last):\n"
+            "Exception handling is not configured\n"
+            "Errors were found\n"
+        )
+        self.assertIsNone(get_failure_reason(log))
+
+    def test_redacts_url_credentials_and_query(self):
+        reason = get_failure_reason(
+            "ERROR fetch failed: https://user:s3cret@example.com/data/file.tif"
+            "?X-Amz-Signature=abc&X-Amz-Credential=def failed"
+        )
+        self.assertEqual(
+            reason,
+            "ERROR fetch failed: https://***REDACTED***@example.com/data/file.tif"
+            "?***REDACTED*** failed",
+        )
+
+    def test_redacts_tokens(self):
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.c2lnbmF0dXJl"
+        cases = {
+            "ERROR request with Bearer abc.def-123 rejected":
+                "ERROR request with Bearer ***REDACTED*** rejected",
+            "ERROR header Authorization: Basic dXNlcjpwYXNz was refused":
+                "ERROR header Authorization: ***REDACTED***",
+            f"ERROR invalid token {jwt}": "ERROR invalid token ***REDACTED***",
+        }
+        for log, expected in cases.items():
+            self.assertEqual(get_failure_reason(log), expected)
+
+    def test_redacts_query_of_url_with_apostrophe(self):
+        reason = get_failure_reason(
+            "ERROR fetching https://example.com/John's-image.tif?X-Amz-Signature=it's-secret"
+        )
+        self.assertEqual(
+            reason, "ERROR fetching https://example.com/John's-image.tif?***REDACTED***"
+        )
+
+    def test_redacts_whole_authorization_value(self):
+        for value in [
+            "AWS4-HMAC-SHA256 Credential=AKIA/x, SignedHeaders=host, Signature=abc123",
+            'Digest username="u", nonce="n0nce", response="r3sp"',
+        ]:
+            reason = get_failure_reason(f"ERROR sent Authorization: {value}")
+            self.assertEqual(reason, "ERROR sent Authorization: ***REDACTED***")
+
+    def test_redacts_before_truncating(self):
+        secret = "s" * 600
+        reason = get_failure_reason("ERROR " + "x" * 480 + f" Bearer {secret}")
+        self.assertNotIn("sss", reason)
+
 
 @mock.patch.dict(
     os.environ,
@@ -145,6 +208,29 @@ class TestExecuteFailure(unittest.TestCase):
 
     def test_failed_run_usage_report_error(self):
         self.execution.get_usage_report.side_effect = RuntimeError("helper pod")
+        _, result = self.run_execute(succeeded=False)
+        self.assertEqual(result, zoo_calrissian_runner.zoo.SERVICE_FAILED)
+        self.session.dispose_job_resources.assert_called_once()
+
+    def test_failed_run_logs_delivered_without_report(self):
+        self.execution.get_usage_report.side_effect = RuntimeError("no report.json")
+        self.execution.get_tool_logs.side_effect = RuntimeError("no tool logs")
+        self.run_execute(succeeded=False)
+        kwargs = self.handler.handle_outputs.call_args.kwargs
+        self.assertEqual(kwargs["log"], NESTED_STEP_LOG)
+        self.assertIsNone(kwargs["usage_report"])
+        self.assertEqual(kwargs["tool_logs"], [])
+
+    def test_failed_run_tool_logs_delivered_without_report(self):
+        self.execution.get_usage_report.side_effect = RuntimeError("no report.json")
+        self.execution.get_tool_logs.return_value = ["tool.log"]
+        self.run_execute(succeeded=False)
+        kwargs = self.handler.handle_outputs.call_args.kwargs
+        self.assertIsNone(kwargs["usage_report"])
+        self.assertEqual(kwargs["tool_logs"], ["tool.log"])
+
+    def test_failed_run_handle_outputs_error(self):
+        self.handler.handle_outputs.side_effect = RuntimeError("s3 down")
         _, result = self.run_execute(succeeded=False)
         self.assertEqual(result, zoo_calrissian_runner.zoo.SERVICE_FAILED)
         self.session.dispose_job_resources.assert_called_once()

@@ -20,8 +20,31 @@ from zoo_calrissian_runner.handlers import ExecutionHandler
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 FAILED_STEP = re.compile(r"\[step [^\]]+\] completed (permanentFail|temporaryFail)")
-EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(Error|Exception|Exit)\b")
+# the last line of a traceback: an optionally dotted exception name, then ":" or nothing
+EXCEPTION_LINE = re.compile(
+    r"^(?:[A-Za-z_]\w*\.)*(?:[A-Za-z_]\w*)?(?:Error|Exception|Exit)(?::|$)"
+)
 MAX_FAILURE_REASON_LENGTH = 500
+
+# The failure reason is shown to end users, so mask anything that looks like a secret.
+# Same placeholder as the calrissian log redaction.
+REDACTED = "***REDACTED***"
+URL_USERINFO = re.compile(r"(\b[A-Za-z][\w+.-]*://)[^\s/@]+@")
+URL_QUERY = re.compile(r"(\b[A-Za-z][\w+.-]*://[^\s?#\"]+)\?\S*")
+# schemes like AWS4-HMAC-SHA256 and Digest spread secrets over the rest of the line
+AUTHORIZATION = re.compile(r"(\bAuthorization[\"']?\s*[:=]\s*).*", re.IGNORECASE)
+BEARER = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+JWT = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+
+def redact_secrets(text: str) -> str:
+    """Returns text with credentials, URL queries and tokens replaced by a placeholder"""
+    text = JWT.sub(REDACTED, text)
+    text = URL_USERINFO.sub(rf"\g<1>{REDACTED}@", text)
+    text = URL_QUERY.sub(rf"\g<1>?{REDACTED}", text)
+    text = AUTHORIZATION.sub(rf"\g<1>{REDACTED}", text)
+    text = BEARER.sub(rf"\g<1>{REDACTED}", text)
+    return text
 
 
 def get_failure_reason(log: Optional[str]) -> Optional[str]:
@@ -54,6 +77,8 @@ def get_failure_reason(log: Optional[str]) -> Optional[str]:
         if errors:
             reason = errors[-1].strip()
 
+    if reason is not None:
+        reason = redact_secrets(reason)
     if reason is not None and len(reason) > MAX_FAILURE_REASON_LENGTH:
         reason = reason[: MAX_FAILURE_REASON_LENGTH - 3] + "..."
     return reason
@@ -606,9 +631,18 @@ class ZooCalrissianRunner:
 
     def deliver_failure_logs(self, log):
         """Delivers the logs and usage report of a failed execution, without outputs"""
+        # Calrissian can fail before writing the report or tool logs; deliver the log anyway.
         try:
             usage_report = self.execution.get_usage_report()
+        except Exception as e:
+            logger.warning(f"could not read the usage report of the failed execution: {e}")
+            usage_report = None
+        try:
             tool_logs = self.execution.get_tool_logs()
+        except Exception as e:
+            logger.warning(f"could not read the tool logs of the failed execution: {e}")
+            tool_logs = None
+        try:
             self.handler.handle_outputs(
                 log=log,
                 output=None,
