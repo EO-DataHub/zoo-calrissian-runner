@@ -132,6 +132,26 @@ class TestGetFailureReason(unittest.TestCase):
             reason = get_failure_reason(f"ERROR sent Authorization: {value}")
             self.assertEqual(reason, "ERROR sent Authorization: ***REDACTED***")
 
+    def test_redacts_named_secrets(self):
+        cases = {
+            "ERROR bad env AWS_SECRET_ACCESS_KEY=abc123 in pod":
+                "ERROR bad env AWS_SECRET_ACCESS_KEY=***REDACTED*** in pod",
+            "ERROR spec {'name': 'WORKSPACE_ACCESS_TOKEN', 'value': 'abc123'} rejected":
+                "ERROR spec {'name': 'WORKSPACE_ACCESS_TOKEN', 'value': ***REDACTED***} rejected",
+            'ERROR config {"password": "hunter2", "user": "bob"}':
+                'ERROR config {"password": ***REDACTED***, "user": "bob"}',
+        }
+        for log, expected in cases.items():
+            self.assertEqual(get_failure_reason(log), expected)
+
+    def test_keeps_ordinary_errors(self):
+        for line in [
+            "KeyError: 'steps'",
+            "AttributeError: 'list' object has no attribute 'keys'",
+            "ERROR Unexpected value for key: main",
+        ]:
+            self.assertEqual(get_failure_reason("Traceback (most recent call last):\n" + line), line)
+
     def test_redacts_before_truncating(self):
         secret = "s" * 600
         reason = get_failure_reason("ERROR " + "x" * 480 + f" Bearer {secret}")

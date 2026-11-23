@@ -34,6 +34,18 @@ URL_QUERY = re.compile(r"(\b[A-Za-z][\w+.-]*://[^\s?#\"]+)\?\S*")
 # schemes like AWS4-HMAC-SHA256 and Digest spread secrets over the rest of the line
 AUTHORIZATION = re.compile(r"(\bAuthorization[\"']?\s*[:=]\s*).*", re.IGNORECASE)
 BEARER = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+# values of settings whose name says they are secret, as key=value, key: value
+# or the name/value pairs of a kubernetes env list
+SECRET_NAME = r"[\w.-]*(?:secret|token|password|passwd|credential|api_?key|access_?key|private_?key)[\w.-]*"
+SECRET_ASSIGNMENT = re.compile(
+    rf"((?<![\w.-]){SECRET_NAME}[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}}\]]+)",
+    re.IGNORECASE,
+)
+SECRET_ENV_ENTRY = re.compile(
+    rf"(name[\"']?\s*[:=]\s*[\"']{SECRET_NAME}[\"']\s*,\s*[\"']?value[\"']?\s*[:=]\s*)"
+    rf"(?:\"[^\"]*\"|'[^']*'|[^\s,;}}\]]+)",
+    re.IGNORECASE,
+)
 JWT = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
 
 
@@ -44,6 +56,8 @@ def redact_secrets(text: str) -> str:
     text = URL_QUERY.sub(rf"\g<1>?{REDACTED}", text)
     text = AUTHORIZATION.sub(rf"\g<1>{REDACTED}", text)
     text = BEARER.sub(rf"\g<1>{REDACTED}", text)
+    text = SECRET_ENV_ENTRY.sub(rf"\g<1>{REDACTED}", text)
+    text = SECRET_ASSIGNMENT.sub(rf"\g<1>{REDACTED}", text)
     return text
 
 
