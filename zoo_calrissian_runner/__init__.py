@@ -1,9 +1,10 @@
 import inspect
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
-from typing import Union
+from typing import Optional, Union
 
 import attr
 import cwl_utils
@@ -16,6 +17,85 @@ from pycalrissian.job import CalrissianJob
 from pycalrissian.utils import copy_to_volume
 
 from zoo_calrissian_runner.handlers import ExecutionHandler
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+FAILED_STEP = re.compile(r"\[step [^\]]+\] completed (permanentFail|temporaryFail)")
+# the last line of a traceback: an optionally dotted exception name, then ":" or nothing
+EXCEPTION_LINE = re.compile(
+    r"^(?:[A-Za-z_]\w*\.)*(?:[A-Za-z_]\w*)?(?:Error|Exception|Exit)(?::|$)"
+)
+MAX_FAILURE_REASON_LENGTH = 500
+
+# The failure reason is shown to end users, so mask anything that looks like a secret.
+# Same placeholder as the calrissian log redaction.
+REDACTED = "***REDACTED***"
+URL_USERINFO = re.compile(r"(\b[A-Za-z][\w+.-]*://)[^\s/@]+@")
+URL_QUERY = re.compile(r"(\b[A-Za-z][\w+.-]*://[^\s?#\"]+)\?\S*")
+# schemes like AWS4-HMAC-SHA256 and Digest spread secrets over the rest of the line
+AUTHORIZATION = re.compile(r"(\bAuthorization[\"']?\s*[:=]\s*).*", re.IGNORECASE)
+BEARER = re.compile(r"(\bBearer\s+)[A-Za-z0-9._~+/=-]+", re.IGNORECASE)
+# values of settings whose name says they are secret, as key=value, key: value
+# or the name/value pairs of a kubernetes env list
+SECRET_NAME = r"[\w.-]*(?:secret|token|password|passwd|credential|api_?key|access_?key|private_?key)[\w.-]*"
+SECRET_ASSIGNMENT = re.compile(
+    rf"((?<![\w.-]){SECRET_NAME}[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}}\]]+)",
+    re.IGNORECASE,
+)
+SECRET_ENV_ENTRY = re.compile(
+    rf"(name[\"']?\s*[:=]\s*[\"']{SECRET_NAME}[\"']\s*,\s*[\"']?value[\"']?\s*[:=]\s*)"
+    rf"(?:\"[^\"]*\"|'[^']*'|[^\s,;}}\]]+)",
+    re.IGNORECASE,
+)
+JWT = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*")
+
+
+def redact_secrets(text: str) -> str:
+    """Returns text with credentials, URL queries and tokens replaced by a placeholder"""
+    text = JWT.sub(REDACTED, text)
+    text = URL_USERINFO.sub(rf"\g<1>{REDACTED}@", text)
+    text = URL_QUERY.sub(rf"\g<1>?{REDACTED}", text)
+    text = AUTHORIZATION.sub(rf"\g<1>{REDACTED}", text)
+    text = BEARER.sub(rf"\g<1>{REDACTED}", text)
+    text = SECRET_ENV_ENTRY.sub(rf"\g<1>{REDACTED}", text)
+    text = SECRET_ASSIGNMENT.sub(rf"\g<1>{REDACTED}", text)
+    return text
+
+
+def get_failure_reason(log: Optional[str]) -> Optional[str]:
+    """Returns the line of the calrissian log that best explains a failed execution"""
+    if not log:
+        return None
+    lines = [ANSI_ESCAPE.sub("", line).rstrip() for line in log.splitlines()]
+    lines = [line for line in lines if line.strip()]
+
+    reason = None
+    # the first failed step is the innermost one
+    for line in lines:
+        match = FAILED_STEP.search(line)
+        if match:
+            reason = match.group(0)
+            break
+
+    if reason is None:
+        tracebacks = [
+            i for i, line in enumerate(lines) if line == "Traceback (most recent call last):"
+        ]
+        if tracebacks:
+            for line in lines[tracebacks[-1] + 1:]:
+                if EXCEPTION_LINE.match(line):
+                    reason = line
+                    break
+
+    if reason is None:
+        errors = [line for line in lines if "ERROR" in line]
+        if errors:
+            reason = errors[-1].strip()
+
+    if reason is not None:
+        reason = redact_secrets(reason)
+    if reason is not None and len(reason) > MAX_FAILURE_REASON_LENGTH:
+        reason = reason[: MAX_FAILURE_REASON_LENGTH - 3] + "..."
+    return reason
 
 
 # useful class for hints in CWL
@@ -297,6 +377,7 @@ class ZooCalrissianRunner:
         self.job_id = conf["lenv"]["usid"]
 
         self.handler = execution_handler
+        self.failure_reason = None
 
         self.storage_class = os.environ.get("STORAGE_CLASS", "openebs-nfs-test")
         self.monitor_interval = 30
@@ -483,6 +564,8 @@ class ZooCalrissianRunner:
                 debug=True,
                 no_read_only=True,
                 tool_logs=True,
+                backoff_limit=0,
+                retry_on_disruption=True,
                 calling_workspace=self.calling_workspace,
                 executing_workspace=self.executing_workspace,
                 job_id=self.job_id,
@@ -499,35 +582,42 @@ class ZooCalrissianRunner:
             if self.execution.is_complete():
                 logger.info("execution complete")
 
+            # read the calrissian log now, clean-up deletes the job and its pod
+            log = self.get_execution_log()
+
             if self.execution.is_succeeded():
                 exit_value = zoo.SERVICE_SUCCEEDED
             else:
                 exit_value = zoo.SERVICE_FAILED
+                self.failure_reason = get_failure_reason(log)
+                logger.error(f"execution failed: {self.failure_reason}")
 
             self.update_status(progress=90, message="delivering outputs, logs and usage report")
 
-            logger.info("handle outputs execution logs")
-            output = self.execution.get_output()
-            log = self.execution.get_log()
-            usage_report = self.execution.get_usage_report()
-            tool_logs = self.execution.get_tool_logs()
+            if exit_value == zoo.SERVICE_SUCCEEDED:
+                logger.info("handle outputs execution logs")
+                output = self.execution.get_output()
+                usage_report = self.execution.get_usage_report()
+                tool_logs = self.execution.get_tool_logs()
 
-            self.outputs.set_output(output)
+                self.outputs.set_output(output)
 
-            self.handler.handle_outputs(
-                log=log,
-                output=output,
-                usage_report=usage_report,
-                tool_logs=tool_logs,
-            )
+                self.handler.handle_outputs(
+                    log=log,
+                    output=output,
+                    usage_report=usage_report,
+                    tool_logs=tool_logs,
+                )
 
-            self.update_status(progress=97, message="Post-execution hook")
-            self.handler.post_execution_hook(
-                log=log,
-                output=output,
-                usage_report=usage_report,
-                tool_logs=tool_logs,
-            )
+                self.update_status(progress=97, message="Post-execution hook")
+                self.handler.post_execution_hook(
+                    log=log,
+                    output=output,
+                    usage_report=usage_report,
+                    tool_logs=tool_logs,
+                )
+            else:
+                self.deliver_failure_logs(log)
         finally:
             self.update_status(progress=99, message="clean-up processing resources")
 
@@ -538,12 +628,43 @@ class ZooCalrissianRunner:
             else:
                 logger.info("kubernetes resources not cleaned up")
 
-        self.update_status(
-            progress=100,
-            message=f'execution {"failed" if exit_value == zoo.SERVICE_FAILED else "successful"}',
-        )
+        message = f'execution {"failed" if exit_value == zoo.SERVICE_FAILED else "successful"}'
+        if self.failure_reason:
+            message = f"{message}: {self.failure_reason}"
+        self.update_status(progress=100, message=message)
 
         return exit_value
+
+    def get_execution_log(self) -> Optional[str]:
+        """Returns the calrissian log, or None when it cannot be read"""
+        try:
+            return self.execution.get_log()
+        except Exception as e:
+            logger.warning(f"could not read the calrissian log: {e}")
+            return None
+
+    def deliver_failure_logs(self, log):
+        """Delivers the logs and usage report of a failed execution, without outputs"""
+        # Calrissian can fail before writing the report or tool logs; deliver the log anyway.
+        try:
+            usage_report = self.execution.get_usage_report()
+        except Exception as e:
+            logger.warning(f"could not read the usage report of the failed execution: {e}")
+            usage_report = None
+        try:
+            tool_logs = self.execution.get_tool_logs()
+        except Exception as e:
+            logger.warning(f"could not read the tool logs of the failed execution: {e}")
+            tool_logs = None
+        try:
+            self.handler.handle_outputs(
+                log=log,
+                output=None,
+                usage_report=usage_report,
+                tool_logs=tool_logs or [],
+            )
+        except Exception as e:
+            logger.warning(f"could not deliver the logs of the failed execution: {e}")
 
     def wrap(self):
         workflow_id = self.get_workflow_id()
